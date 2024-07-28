@@ -6,86 +6,79 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 
-// Create a new host application builder
 var builder = Host.CreateApplicationBuilder(args);
 
-// Serilog 
 builder.Services.AddSingleton<ILogger>(new LoggerConfiguration()
     .WriteTo.Console()
     .WriteTo.File($"{DateTime.Now:yyyyMMddHHmmss}.log")
     .CreateLogger()
 );
 
-// Register the IScraper interface with the ScraperService implementation
 builder.Services.AddScoped<IScraper, ScraperService>();
 
-// Build a configuration object using environment variables and JSON providers
 IConfiguration config = new ConfigurationBuilder()
     .AddJsonFile("appSettings.json")
     .AddJsonFile("chromeSettings.json")
-    .AddJsonFile("googleFlightSettings.json") // Additional settings
+    .AddJsonFile("googleFlightSettings.json")
     .AddEnvironmentVariables()
     .Build();
 
-// Bind entire JSON files to IOptions for AppSettings and ChromeSettings
 builder.Services.Configure<AppSettings>(config);
 builder.Services.Configure<ChromeSettings>(config);
-
-// Add new interfaces and configuration for GoogleFlight
 builder.Services.AddScoped<IGoogleFlight, GoogleFlightService>();
+builder.Services.AddScoped<ICsvService, CsvService>();
 builder.Services.Configure<GoogleFlightSettings>(config);
 
-// Check values in appSettings file
-int delta = config.GetValue<int>("HowManyDays");
-int flexDays = config.GetValue<int>("FlexDays");
 DateTime outbound = DateTime.Parse(config.GetSection("FirstDepartureDate").Value!);
 DateTime lastDate = DateTime.Parse(config.GetSection("LastDepartureDate").Value!);
+int howManyDays = config.GetValue<int>("HowManyDays");
+int flexDays = config.GetValue<int>("FlexDays");
+bool onlyWeekend = config.GetValue<bool>("OnlyWeekend");
+List<string> fromAirports = config.GetSection("FromAirports").Get<List<string>>()!;
+List<string> toAirports = config.GetSection("ToAirports").Get<List<string>>()!;
 
-// Check for valid integer range inputs
-if (delta <= 0 || flexDays < 0)
+if (howManyDays <= 0)
 {
-    throw new Exception("Please check for valid range input in appSettings.json");
+    throw new Exception("Please check for valid range input in appSettings.json (HowManyDays)");
 }
-
-// Check for valid dates
-if (outbound < DateTime.Now.Date || lastDate <= DateTime.Now.Date || outbound == lastDate)
+if (lastDate <= DateTime.Now.Date || outbound == lastDate)
 {
-    throw new Exception("Please check for valid date input in appSettings.json");
+    throw new Exception("Please check for valid date input in appSettings.json (FirstDepartureDate, LastDepartureDate)");
 }
-
-// Ask user if want to continue
-Console.WriteLine(Environment.NewLine);
-Console.WriteLine("AVOLOAVOLO.it TRIBUTE" + Environment.NewLine);
-Console.WriteLine("Configure scraper parameters in 'appSettings.json' file." + Environment.NewLine);
-Console.WriteLine("Do you want to continue? (Any key to continue, 'n' to exit)" + Environment.NewLine);
-
-string userInput = Console.ReadLine()!;
-
-if (userInput.ToLower() == "n")
+if (outbound <= DateTime.Now.Date)
 {
-    Environment.Exit(0);
+    outbound = DateTime.Now.AddDays(1);
 }
+//Console.WriteLine(Environment.NewLine + "AVOLOAVOLO.it TRIBUTE" + Environment.NewLine);
+//Console.WriteLine("Configure scraper parameters in 'appSettings.json' file." + Environment.NewLine);
+//Console.WriteLine("Do you want to continue? (Any key to continue, 'n' to exit)" + Environment.NewLine);
+//string userInput = Console.ReadLine()!;
+//if (userInput.ToLower() == "n")
+//{
+//    Environment.Exit(0);
+//}
 
-// Build the host
 var host = builder.Build();
 
-// Crate the scope
 using (var scope = host.Services.CreateScope())
 {
     var services = scope.ServiceProvider;
+    var scraper = services.GetRequiredService<IGoogleFlight>();
     try
     {
-        // Get required service
-        var scraper = services.GetRequiredService<IGoogleFlight>();
+        scraper.InitScraper(outbound, lastDate, howManyDays, flexDays, onlyWeekend, fromAirports, toAirports);
 
-        // Provide the filename
-        scraper.StartScraperLoop();
-
-        // Quit the driver
         scraper.StopScraper();
     }
-    catch (Exception ex) { throw new Exception(ex.Message); }
+    catch (Exception ex) 
+    {
+        scraper.StopScraper();
+        throw new Exception(ex.Message, ex); 
+    }
 
-    finally { scope.Dispose(); }
+    finally 
+    { 
+        scope.Dispose(); 
+    }
 }
 

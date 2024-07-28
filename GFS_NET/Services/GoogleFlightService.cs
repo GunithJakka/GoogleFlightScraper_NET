@@ -5,113 +5,131 @@ using Microsoft.Extensions.Options;
 
 namespace GFS_NET.Services
 {
-    public class GoogleFlightService : IGoogleFlight
+    public class GoogleFlightService(IScraper scraper, IOptions<GoogleFlightSettings> googleOpt, ILogger logger, ICsvService csvService) : IGoogleFlight
     {
-        private string _outFile;
-        private readonly ILogger _log;
-        private readonly IScraper _scraper;
-        private readonly AppSettings _opt;
-        private readonly GoogleFlightSettings _googleOpt;
-
-        public GoogleFlightService(IScraper scraper, IOptions<AppSettings> appSettings, IOptions<GoogleFlightSettings> googleOpt, ILogger logger)
-        {
-            _log = logger;
-            _scraper = scraper;
-            _opt = appSettings.Value;
-            _googleOpt = googleOpt.Value;
-            _outFile = DateTime.Now.ToString("yyyyMMddHHmmss") + ".csv";
-        }
+        private readonly ICsvService _csvService = csvService;
+        private readonly ILogger _logger = logger;
+        private readonly IScraper _scraper = scraper;
+        private readonly string _baseURL = googleOpt.Value.BaseUrl;
+        private readonly Dictionary<string, string> _xpathDict = googleOpt.Value.Xpaths.ToDictionary();
 
         public void StopScraper()
         {
             _scraper.Dispose();
         }
 
-        public void StartScraperLoop()
+        public void InitScraper(
+            DateTime outbound, DateTime lastdate, int howManyDays, int flexDays, bool onlyWeekend, List<string> fromAirports, List<string> toAirports)
         {
-            // Get options
-            DateTime outbound = _opt.FirstDepartureDate;
-            DateTime lastdate = _opt.LastDepartureDate;
+            DateTime startTime = DateTime.Now;
+            string csvFileName = $"{startTime.ToLongTimeString()}.csv";
+            _logger.Information($"Loop start at {startTime}");
+
+            int totCount = StartScraperLoop(outbound, lastdate, howManyDays, flexDays, onlyWeekend,fromAirports, toAirports, csvFileName);
+
+            DateTime endTime = DateTime.Now;
+            _logger.Information($"Loop end at {endTime}.");
+            _logger.Information($"Total time elapsed: {(endTime - startTime).TotalHours} (hours)");
+            _logger.Information($"Total search count: {totCount}");
+
+            if (totCount > 0)
+            {
+                var (totRowCount, csvSorted) = _csvService.SortCSVFile(csvFileName);
+                _logger.Information($"Result file raw: {csvFileName}.");
+                _logger.Information($"Result file sorted by price: {csvSorted}.");
+                _logger.Information($"Result file total row count: {totRowCount}.");
+            }
+
+            _logger.Information($"Goodbye, hope it helps.");
+        }
+
+
+        private string GoogleFlightUrlBuilder(string from, string to, string outbound, string inbound)
+        {
+            return $"{_baseURL.Replace("{TO}", to).Replace("{FROM}", from).Replace("{OUTBOUND}", outbound).Replace("{INBOUND}", inbound)}";
+        }
+
+        private bool ScrapeAndSaveInfo(string fromAirport, string toAirport, DateTime outbound, DateTime inbound, string csvFileName)
+        {
+            string outboundDateStr = outbound.ToString("yyyy-MM-dd");
+            string inboundDateStr = inbound.ToString("yyyy-MM-dd");
+
+            string url = GoogleFlightUrlBuilder(fromAirport, toAirport, outboundDateStr, inboundDateStr);
+
+            _logger.Information($"Search: FROM {fromAirport} | TO {toAirport} | DEPARTURE {outboundDateStr} | RETURN {inboundDateStr}");
+
+            List<string>? results = _scraper.GetElementsFromXpathDict(url, _xpathDict);
+
+            if (results == null || results.Count == 0)
+            {
+                _logger.Information($"Search has no result.");
+                return false;
+            }
+
+            _logger.Information("Result: " + string.Join(" | ", results));
+
+            return _csvService.AppendToCsvFile(results, outboundDateStr, inboundDateStr, csvFileName);
+        }
+
+        private int StartScraperLoop(
+            DateTime outbound, DateTime lastdate, int howManyDays, int flexDays, bool onlyWeekend, List<string> fromAirports, List<string> toAirports, string csvFileName)
+        {
             TimeSpan period = lastdate - outbound;
 
-            _log.Information($"Writing results in: {_outFile}");
-            _log.Information("ScraperLoop start");
-
-            // Weekend inex
+            int totCount = 0;
             int iWeekend = 0;
+            int consecutiveFailures = 0;
 
-            foreach (string fromAirport in _opt.FromAirports)
+            foreach (string fromAirport in fromAirports)
             {
-                foreach (string toAirport in _opt.ToAirports)
+                foreach (string toAirport in toAirports)
                 {
                     for (int i = 0; i < period.Days; i++)
                     {
-                        // Update dates
-                        DateTime newOutbound = outbound.AddDays(i);
-                        DateTime newInbound = newOutbound.AddDays(_opt.HowManyDays);
-
-                        if (_opt.OnlyWeekend)
+                        if (consecutiveFailures >= 5)
                         {
-                            if (i == 0) { iWeekend = 0; }
+                            _logger.Information($"Break! Too many consecutive search with no result. ({consecutiveFailures})");
+                            break;
+                        }
+
+                        DateTime newOutbound = outbound.AddDays(i);
+                        DateTime newInbound = newOutbound.AddDays(howManyDays);
+
+                        if (onlyWeekend)
+                        {
+                            iWeekend = i == 0 ? 0 : iWeekend;
                             newOutbound = DateTimeExtensions.NextWeekendDay(newOutbound.AddDays(iWeekend));
-                            newInbound = newOutbound.AddDays(_opt.HowManyDays);
+                            newInbound = newOutbound.AddDays(howManyDays);
                             iWeekend += 5;
                         }
 
-                        // Check if outbound equal to LastDate break loop
-                        if (lastdate.Date == newOutbound.Date)
+                        if (newOutbound.Date >= lastdate.Date)
                         {
-                            _log.Information("Break loop! LastDate is equal to Outbound.");
+                            _logger.Information($"Break! The departure date is equal to LastDepartureDate. ({lastdate:yyyy-MM-dd})");
                             break;
                         }
-                        // Scrape from inputs 
-                        ScrapeFromInputs(
-                            fromAirport,
-                            toAirport,
-                            newOutbound.ToString("yyyy-MM-dd"),
-                            newInbound.ToString("yyyy-MM-dd")
-                        );
 
-                        // Iterate over flex days
-                        if (_opt.FlexDays > 0)
+                        bool res = ScrapeAndSaveInfo(fromAirport, toAirport, newOutbound, newInbound, csvFileName);
+                        consecutiveFailures = res == true ? 0 : ++consecutiveFailures;
+                        totCount++;
+
+                        if (flexDays > 0)
                         {
-                            for (int j = 0; j < _opt.FlexDays; j++)
+                            for (int j = 0; j < flexDays; j++)
                             {
-                                // Update dates
-                                newInbound = newOutbound.AddDays(j + 1 + _opt.HowManyDays);
-                                // Scrape from inputs 
-                                ScrapeFromInputs(
-                                    fromAirport,
-                                    toAirport,
-                                    newOutbound.ToString("yyyy-MM-dd"),
-                                    newInbound.ToString("yyyy-MM-dd")
-                                );
-
+                                newInbound = newOutbound.AddDays(j + 1 + howManyDays);
+                                bool flexRes = ScrapeAndSaveInfo(fromAirport, toAirport, newOutbound, newInbound, csvFileName);
+                                consecutiveFailures = flexRes == true ? 0 : ++consecutiveFailures;
+                                totCount++;
                             }
                         }
                     }
+
+                    consecutiveFailures = 0;
                 }
             }
-            _log.Information("ScraperLoop end");
-        }
 
-        public void ScrapeFromInputs(string fromAirport, string toAirport, string outbound, string inbound)
-        {
-            string url = CustomHelpers.GoogleFlightUrlBuilder(_googleOpt.BaseUrl, fromAirport, toAirport, outbound, inbound);
-
-            List<string>? results = _scraper.GetElementsFromXPathList(url, _googleOpt.Xpaths.ToList());
-
-            if (results != null)
-            {
-                // Insert dates in results list
-                results.InsertRange(0, new List<string> { outbound, inbound });
-
-                // Print results (results is a List<string>)
-                _log.Information(string.Join(" | ", results));
-
-                // Add newResult to CSV file
-                CustomHelpers.AddListToCsvFile(results, _outFile);
-            }
+            return totCount;
         }
     }
 }

@@ -2,8 +2,7 @@
 {
     public interface IGoogleFlight
     {
-        void StartScraperLoop();
-        void ScrapeFromInputs(string fromAirport, string toAirport, string outbound, string inbound);
+        void InitScraper(DateTime outbound, DateTime lastdate, int howManyDays, int flexDays, bool onlyWeekend, List<string> fromAirports, List<string> toAirports);
         void StopScraper();
     }
 }
